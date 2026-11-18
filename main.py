@@ -111,7 +111,7 @@ async def start_cmd(message: types.Message):
 @dp.message(F.text.contains("music.yandex"))
 async def handle_yandex_link(message: types.Message):
     url = message.text.strip()
-    status_msg = await message.answer("🔍 Распознаю ссылку...")
+    status_msg = await message.answer("🔍 Распознаю ссылку...", parse_mode=None)
 
     try:
         # 1. Проверка на отдельный трек
@@ -120,8 +120,6 @@ async def handle_yandex_link(message: types.Message):
             track_id = track_match.group(1)
             await status_msg.edit_text("🔍 Скачиваю трек в высоком качестве...")
 
-            # Проверяем кэш file_id для отдельного трека
-            t_start = time.time()
             if int(track_id) in track_file_cache:
                 t_cache_start = time.time()
                 await message.answer_audio(
@@ -129,7 +127,7 @@ async def handle_yandex_link(message: types.Message):
                     title="Трек",
                     performer="Яндекс Музыка"
                 )
-                print(f"[Кэш] Отдельный трек отправлен за {time.time() - t_cache_start:.2f} сек")
+                print(f"[Кэш] Отдельный трек отправлен за {time.time() - t_cache_start:.2f} сек", flush=True)
                 await status_msg.delete()
                 return
 
@@ -143,7 +141,7 @@ async def handle_yandex_link(message: types.Message):
 
             t_dl = time.time()
             meta = await asyncio.to_thread(download_track_obj, track_obj, path)
-            print(f"[Загрузка с Яндекса] Трек скачан за {time.time() - t_dl:.2f} сек")
+            print(f"[Загрузка с Яндекса] Трек скачан за {time.time() - t_dl:.2f} сек", flush=True)
 
             await status_msg.edit_text("📤 Отправляю музыку...")
             t_up = time.time()
@@ -152,8 +150,7 @@ async def handle_yandex_link(message: types.Message):
                 title=meta["title"],
                 performer=meta["artist"],
             )
-            print(f"[Загрузка в Telegram] Трек отправлен за {time.time() - t_up:.2f} сек")
-            print(f"Всего обработка трека заняла: {time.time() - t_start:.2f} сек\n---")
+            print(f"[Загрузка в Telegram] Трек отправлен за {time.time() - t_up:.2f} сек\n---", flush=True)
 
             if msg.audio:
                 track_file_cache[track_obj.id] = msg.audio.file_id
@@ -183,6 +180,7 @@ async def handle_yandex_link(message: types.Message):
                 try:
                     resp = requests.get(f"https://music.yandex.ru/playlists/{uuid}", headers=headers,
                                         allow_redirects=True, timeout=5)
+                    print(f"[DEBUG] UUID-страница: статус={resp.status_code}, url={resp.url}, длина={len(resp.text)}", flush=True)
                     m = USER_PLAYLIST_RE.search(resp.url)
                     if m:
                         u, k = m.groups()
@@ -196,7 +194,7 @@ async def handle_yandex_link(message: types.Message):
                     if owner_match and kind_match:
                         return ym_client.users_playlists(kind_match.group(1), owner_match.group(1))
                 except Exception as ex:
-                    print(f"Ошибка авто-распознавания UUID: {ex}")
+                    print(f"Ошибка авто-распознавания UUID: {ex}", flush=True)
                 return None
 
             playlist = await asyncio.to_thread(resolve_mobile_playlist)
@@ -211,14 +209,20 @@ async def handle_yandex_link(message: types.Message):
                         tracks.extend(vol)
 
         if playlist:
+            print(f"[DEBUG] плейлист={playlist.title!r}, элементов={len(playlist.tracks or [])}", flush=True)
+            if playlist.tracks:
+                first = playlist.tracks[0]
+                print(f"[DEBUG] тип элемента={type(first).__name__}, track пустой={getattr(first, 'track', 'НЕТ ATTR') is None}", flush=True)
+
             playlist_title = playlist.title
             if hasattr(playlist, "fetch_tracks") and (not playlist.tracks or len(playlist.tracks) == 0):
                 await asyncio.to_thread(playlist.fetch_tracks)
 
             if playlist.tracks:
-                tracks = [item.track for item in playlist.tracks if item.track]
+                tracks = [item.track for item in playlist.tracks if getattr(item, "track", None)]
 
         if not tracks:
+            print(f"[DEBUG] треков после фильтрации: 0, playlist={playlist is not None}", flush=True)
             await status_msg.edit_text("⚠️ Не удалось найти треки по этой ссылке или плейлист пуст.")
             return
 
@@ -275,7 +279,6 @@ async def process_download_all(callback: types.CallbackQuery):
             artists = ", ".join(a.name for a in track.artists) if track.artists else "Яндекс Музыка"
 
             try:
-                # 1. Проверка кэша file_id
                 if track_id in track_file_cache:
                     t_cache = time.time()
                     msg = await bot.send_audio(
@@ -284,14 +287,12 @@ async def process_download_all(callback: types.CallbackQuery):
                         title=track.title,
                         performer=artists,
                     )
-                    print(f"[Кэш] Трек '{track.title}' отправлен за {time.time() - t_cache:.2f} сек")
+                    print(f"[Кэш] Трек '{track.title}' отправлен за {time.time() - t_cache:.2f} сек", flush=True)
                 else:
-                    # 2. Скачивание с Яндекса
                     t_dl = time.time()
                     meta = await asyncio.to_thread(download_track_obj, track, path)
-                    print(f"[Яндекс] '{track.title}' скачан за {time.time() - t_dl:.2f} сек")
+                    print(f"[Яндекс] '{track.title}' скачан за {time.time() - t_dl:.2f} сек", flush=True)
 
-                    # 3. Отправка в Telegram
                     t_up = time.time()
                     msg = await bot.send_audio(
                         chat_id=chat_id,
@@ -299,12 +300,10 @@ async def process_download_all(callback: types.CallbackQuery):
                         title=meta["title"],
                         performer=meta["artist"],
                     )
-                    print(f"[Telegram] '{track.title}' загружен за {time.time() - t_up:.2f} сек")
+                    print(f"[Telegram] '{track.title}' загружен за {time.time() - t_up:.2f} сек", flush=True)
 
                     if msg.audio:
                         track_file_cache[track_id] = msg.audio.file_id
-
-                print(f"Всего на трек '{track.title}' ушло {time.time() - t_start:.2f} сек\n---")
 
                 async with lock:
                     success_count += 1
@@ -312,14 +311,13 @@ async def process_download_all(callback: types.CallbackQuery):
                     await status_msg.edit_text(f"⏳ Скачивание плейлиста: выполнено {completed} из {len(tracks)}")
 
             except Exception as e:
-                print(f"Ошибка при обработке трека {track.title}: {e}")
+                print(f"Ошибка при обработке трека {track.title}: {e}", flush=True)
                 async with lock:
                     completed += 1
             finally:
                 if os.path.exists(path):
                     os.remove(path)
 
-    # Запускаем все задачи параллельно, семафор автоматически ограничит их до 3 одновременно
     tasks = [download_and_send_worker(track) for track in tracks]
     await asyncio.gather(*tasks)
 
@@ -344,7 +342,6 @@ async def process_download_track(callback: types.CallbackQuery):
 
     try:
         t_start = time.time()
-        # Проверяем кэш
         if track_id in track_file_cache:
             t_cache = time.time()
             await callback.message.answer_audio(
@@ -352,12 +349,12 @@ async def process_download_track(callback: types.CallbackQuery):
                 title=track.title,
                 performer=", ".join(a.name for a in track.artists) if track.artists else "Яндекс Музыка",
             )
-            print(f"[Кэш] Трек по клику отправлен за {time.time() - t_cache:.2f} сек")
+            print(f"[Кэш] Трек по клику отправлен за {time.time() - t_cache:.2f} сек", flush=True)
             await status_msg.delete()
             return
 
         meta = await asyncio.to_thread(download_track_obj, track, path)
-        print(f"[Яндекс] Трек по клику скачан за {time.time() - t_start:.2f} сек")
+        print(f"[Яндекс] Трек по клику скачан за {time.time() - t_start:.2f} сек", flush=True)
 
         await status_msg.edit_text("📤 Отправляю музыку...")
         t_up = time.time()
@@ -366,7 +363,7 @@ async def process_download_track(callback: types.CallbackQuery):
             title=meta["title"],
             performer=meta["artist"],
         )
-        print(f"[Telegram] Трек по клику отправлен за {time.time() - t_up:.2f} сек")
+        print(f"[Telegram] Трек по клику отправлен за {time.time() - t_up:.2f} сек", flush=True)
 
         if msg.audio:
             track_file_cache[track_id] = msg.audio.file_id
@@ -404,7 +401,7 @@ async def main():
     # 1. Сначала запускаем веб-сервер, чтобы открыть порт для Render
     await start_dummy_server()
     
-    print("Бот успешно запущен и готов к работе со скоростным кэшем и параллельной загрузкой!")
+    print("Бот успешно запущен и готов к работе со скоростным кэшем и параллельной загрузкой!", flush=True)
     
     # 2. Запуск поллинга бота
     await dp.start_polling(bot)
