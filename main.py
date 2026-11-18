@@ -174,49 +174,30 @@ async def handle_yandex_link(message: types.Message):
             uuid = PUBLIC_PLAYLIST_UUID_RE.search(url).group(1)
 
             def resolve_mobile_playlist():
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
+                # Вариант 1: Прямой запрос к API по UUID
                 try:
-                    resp = requests.get(f"https://music.yandex.ru/playlists/{uuid}", headers=headers,
-                                        allow_redirects=True, timeout=5)
-                    print(f"[DEBUG] UUID-страница: статус={resp.status_code}, url={resp.url}, длина={len(resp.text)}", flush=True)
-                    
-                    m = USER_PLAYLIST_RE.search(resp.url)
-                    if m:
-                        u, k = m.groups()
-                        return ym_client.users_playlists(k, u)
-                    
-                    m2 = re.search(r"users/([^/\"']+)/playlists/(\d+)", resp.text)
-                    if m2:
-                        u, k = m2.groups()
-                        return ym_client.users_playlists(k, u)
-                    
-                    # Сверхгибкий поиск owner / login и kind для JS-объектов и JSON
-                    owner_login = None
-                    # Ищем конструкции вида owner: { ... login: '...' } или "owner": { ... "login": "..." }
-                    owner_match = re.search(r'(?:owner\s*:\s*\{[^}]*?login\s*:\s*["\']([^"\']+)["\'])|(?:["\']?owner["\']?\s*:\s*\{[^}]*?["\']?login["\']?\s*:\s*["\']([^"\']+)["\'])|(?:["\']?login["\']?\s*:\s*["\']([^"\']+)["\'])', resp.text)
-                    if owner_match:
-                        for g in owner_match.groups():
-                            if g:
-                                owner_login = g
-                                break
-                    
-                    kind_val = None
-                    kind_match = re.search(r'["\']?kind["\']?\s*:\s*(\d+)', resp.text)
-                    if kind_match:
-                        kind_val = kind_match.group(1)
-                    else:
-                        kind_alt = re.search(r'\bkind\s*:\s*(\d+)', resp.text)
-                        if kind_alt:
-                            kind_val = kind_alt.group(1)
-                    
-                    print(f"[DEBUG] Парсинг UUID: owner={owner_login}, kind={kind_val}", flush=True)
-                    
-                    if owner_login and kind_val:
-                        return ym_client.users_playlists(kind_val, owner_login)
+                    data = ym_client.request.get(f"https://api.music.yandex.net/playlist/{uuid}")
+                    print(f"[DEBUG] API по UUID ответил: {type(data).__name__}", flush=True)
+                    if data:
+                        pl_data = data.get("result", data) if isinstance(data, dict) else data
+                        pl = Playlist.de_json(pl_data, ym_client)
+                        if pl:
+                            return pl
                 except Exception as ex:
-                    print(f"Ошибка авто-распознавания UUID: {ex}", flush=True)
+                    print(f"[DEBUG] API по UUID ошибка: {ex!r}", flush=True)
+
+                # Вариант 2: Диагностика содержимого HTML-страницы
+                try:
+                    resp = requests.get(f"https://music.yandex.ru/playlists/{uuid}",
+                                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                                        timeout=10)
+                    for word in ("owner", "uid", "kind", "login"):
+                        pos = resp.text.find(word)
+                        snippet = resp.text[pos:pos + 120] if pos != -1 else "НЕТ"
+                        print(f"[DEBUG] '{word}': {snippet!r}", flush=True)
+                except Exception as ex:
+                    print(f"[DEBUG] HTML ошибка: {ex!r}", flush=True)
+
                 return None
 
             playlist = await asyncio.to_thread(resolve_mobile_playlist)
@@ -243,7 +224,11 @@ async def handle_yandex_link(message: types.Message):
 
         if not tracks:
             print(f"[DEBUG] треков после фильтрации: 0, playlist={playlist is not None}", flush=True)
-            await status_msg.edit_text("⚠️ Не удалось найти треки по этой ссылке или плейлист пуст.")
+            await status_msg.edit_text(
+                "⚠️ Не удалось открыть плейлист по этой ссылке.\n"
+                "Откройте плейлист в браузере на компьютере и отправьте ссылку из адресной строки "
+                "(вида music.yandex.ru/users/ИМЯ/playlists/123)."
+            )
             return
 
         user_playlists[message.from_user.id] = tracks
