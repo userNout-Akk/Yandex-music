@@ -181,16 +181,26 @@ async def handle_yandex_link(message: types.Message):
                     resp = requests.get(f"https://music.yandex.ru/playlists/{uuid}", headers=headers,
                                         allow_redirects=True, timeout=5)
                     print(f"[DEBUG] UUID-страница: статус={resp.status_code}, url={resp.url}, длина={len(resp.text)}", flush=True)
+                    
                     m = USER_PLAYLIST_RE.search(resp.url)
                     if m:
                         u, k = m.groups()
                         return ym_client.users_playlists(k, u)
+                    
                     m2 = re.search(r"users/([^/\"']+)/playlists/(\d+)", resp.text)
                     if m2:
                         u, k = m2.groups()
                         return ym_client.users_playlists(k, u)
-                    owner_match = re.search(r'"owner"\s*:\s*\{[^}]*"login"\s*:\s*"([^"]+)"', resp.text)
+                    
+                    # Улучшенный гибкий поиск owner и kind в тексте страницы
+                    owner_match = re.search(r'"owner"\s*:\s*\{[^}]*?"login"\s*:\s*"([^"]+)"', resp.text)
+                    if not owner_match:
+                        owner_match = re.search(r'"login"\s*:\s*"([^"]+)"', resp.text)
+                        
                     kind_match = re.search(r'"kind"\s*:\s*(\d+)', resp.text)
+                    
+                    print(f"[DEBUG] Парсинг UUID: owner={owner_match.group(1) if owner_match else 'НЕТ'}, kind={kind_match.group(1) if kind_match else 'НЕТ'}", flush=True)
+                    
                     if owner_match and kind_match:
                         return ym_client.users_playlists(kind_match.group(1), owner_match.group(1))
                 except Exception as ex:
@@ -209,17 +219,15 @@ async def handle_yandex_link(message: types.Message):
                         tracks.extend(vol)
 
         if playlist:
-            print(f"[DEBUG] плейлист={playlist.title!r}, элементов={len(playlist.tracks or [])}", flush=True)
-            if playlist.tracks:
-                first = playlist.tracks[0]
-                print(f"[DEBUG] тип элемента={type(first).__name__}, track пустой={getattr(first, 'track', 'НЕТ ATTR') is None}", flush=True)
-
+            print(f"[DEBUG] плейлист найден={playlist.title!r}, элементов до fetch={len(playlist.tracks or [])}", flush=True)
             playlist_title = playlist.title
+            
             if hasattr(playlist, "fetch_tracks") and (not playlist.tracks or len(playlist.tracks) == 0):
                 await asyncio.to_thread(playlist.fetch_tracks)
 
             if playlist.tracks:
                 tracks = [item.track for item in playlist.tracks if getattr(item, "track", None)]
+                print(f"[DEBUG] треков после распаковки items={len(tracks)}", flush=True)
 
         if not tracks:
             print(f"[DEBUG] треков после фильтрации: 0, playlist={playlist is not None}", flush=True)
