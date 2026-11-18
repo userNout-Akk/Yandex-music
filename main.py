@@ -10,6 +10,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from yandex_music import Client, Playlist
+from aiohttp import web
 
 # Загружаем переменные окружения из файла .env
 load_dotenv()
@@ -384,8 +385,28 @@ async def process_noop(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# Веб-сервер заглушка для Render (чтобы открывать порт и получать статус Live)
+async def handle_ping(request):
+    return web.Response(text="Bot is alive")
+
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/healthz", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
 async def main():
+    # 1. Сначала запускаем веб-сервер, чтобы открыть порт для Render
+    await start_dummy_server()
+    
     print("Бот успешно запущен и готов к работе со скоростным кэшем и параллельной загрузкой!")
+    
+    # 2. Запуск поллинга бота
     await dp.start_polling(bot)
 
 
