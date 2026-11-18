@@ -2,3 +2,4 @@ aiogram
 yt-dlp
 requests
 python-dotenv
+yandex-music
