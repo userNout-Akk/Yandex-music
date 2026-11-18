@@ -192,17 +192,29 @@ async def handle_yandex_link(message: types.Message):
                         u, k = m2.groups()
                         return ym_client.users_playlists(k, u)
                     
-                    # Улучшенный гибкий поиск owner и kind в тексте страницы
-                    owner_match = re.search(r'"owner"\s*:\s*\{[^}]*?"login"\s*:\s*"([^"]+)"', resp.text)
-                    if not owner_match:
-                        owner_match = re.search(r'"login"\s*:\s*"([^"]+)"', resp.text)
-                        
-                    kind_match = re.search(r'"kind"\s*:\s*(\d+)', resp.text)
+                    # Сверхгибкий поиск owner / login и kind для JS-объектов и JSON
+                    owner_login = None
+                    # Ищем конструкции вида owner: { ... login: '...' } или "owner": { ... "login": "..." }
+                    owner_match = re.search(r'(?:owner\s*:\s*\{[^}]*?login\s*:\s*["\']([^"\']+)["\'])|(?:["\']?owner["\']?\s*:\s*\{[^}]*?["\']?login["\']?\s*:\s*["\']([^"\']+)["\'])|(?:["\']?login["\']?\s*:\s*["\']([^"\']+)["\'])', resp.text)
+                    if owner_match:
+                        for g in owner_match.groups():
+                            if g:
+                                owner_login = g
+                                break
                     
-                    print(f"[DEBUG] Парсинг UUID: owner={owner_match.group(1) if owner_match else 'НЕТ'}, kind={kind_match.group(1) if kind_match else 'НЕТ'}", flush=True)
+                    kind_val = None
+                    kind_match = re.search(r'["\']?kind["\']?\s*:\s*(\d+)', resp.text)
+                    if kind_match:
+                        kind_val = kind_match.group(1)
+                    else:
+                        kind_alt = re.search(r'\bkind\s*:\s*(\d+)', resp.text)
+                        if kind_alt:
+                            kind_val = kind_alt.group(1)
                     
-                    if owner_match and kind_match:
-                        return ym_client.users_playlists(kind_match.group(1), owner_match.group(1))
+                    print(f"[DEBUG] Парсинг UUID: owner={owner_login}, kind={kind_val}", flush=True)
+                    
+                    if owner_login and kind_val:
+                        return ym_client.users_playlists(kind_val, owner_login)
                 except Exception as ex:
                     print(f"Ошибка авто-распознавания UUID: {ex}", flush=True)
                 return None
