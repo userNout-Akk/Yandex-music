@@ -2,20 +2,21 @@ import os
 import re
 import asyncio
 import time
-import requests
+import uuid
 import traceback
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramRetryAfter
+from aiogram.client.session.aiohttp import AiohttpSession
 from yandex_music import Client, Playlist
 from aiohttp import web
 
 # Загружаем переменные окружения из файла .env
 load_dotenv()
 
-# Безопасно считываем токены
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 YANDEX_TOKEN = os.getenv("YANDEX_TOKEN")
 
@@ -24,16 +25,19 @@ if not TELEGRAM_BOT_TOKEN:
 if not YANDEX_TOKEN:
     raise ValueError("❌ Критическая ошибка: не найден YANDEX_TOKEN в файле .env!")
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(token=TELEGRAM_BOT_TOKEN, session=AiohttpSession(timeout=300))
 dp = Dispatcher()
 
 ym_client = Client(YANDEX_TOKEN).init()
 
-# Хранилище сессий плейлистов/альбомов для каждого пользователя
+# Хранилище сессий: (chat_id, message_id) -> {"tracks": list, "created_at": float}
 user_playlists = {}
+SESSION_TTL_SECONDS = 3600
+MAX_PLAYLIST_SESSIONS = 100
 
-# Кэш Telegram file_id (track_id -> file_id). Ускоряет повторную отправку треков до нуля!
+# Кэш Telegram file_id: str(track_id) -> file_id
 track_file_cache = {}
+MAX_CACHE_SIZE = 2000
 
 # Семафор для ограничения одновременных потоков загрузки (не больше 3 одновременно)
 download_semaphore = asyncio.Semaphore(3)
@@ -43,6 +47,56 @@ TRACK_RE = re.compile(r"track/(\d+)")
 ALBUM_RE = re.compile(r"album/(\d+)")
 USER_PLAYLIST_RE = re.compile(r"users/([^/]+)/playlists/(\d+)")
 PUBLIC_PLAYLIST_UUID_RE = re.compile(r"playlists/([0-9a-fA-F-]+)")
+
+
+def cleanup_storage():
+    """Очищает устаревшие сессии и ограничивает размер кэша"""
+    now = time.time()
+    expired_keys = [
+        k for k, v in user_playlists.items()
+        if now - v.get("created_at", now) > SESSION_TTL_SECONDS
+    ]
+    for k in expired_keys:
+        user_playlists.pop(k, None)
+
+    while len(user_playlists) > MAX_PLAYLIST_SESSIONS:
+        oldest_key = next(iter(user_playlists))
+        user_playlists.pop(oldest_key, None)
+
+    while len(track_file_cache) > MAX_CACHE_SIZE:
+        oldest_cache_key = next(iter(track_file_cache))
+        track_file_cache.pop(oldest_cache_key, None)
+
+
+def save_playlist_session(chat_id: int, message_id: int, tracks: list):
+    cleanup_storage()
+    user_playlists[(chat_id, message_id)] = {
+        "tracks": tracks,
+        "created_at": time.time(),
+    }
+
+
+def get_playlist_session(chat_id: int, message_id: int) -> list | None:
+    cleanup_storage()
+    session = user_playlists.get((chat_id, message_id))
+    if not session:
+        return None
+    if time.time() - session.get("created_at", 0) > SESSION_TTL_SECONDS:
+        user_playlists.pop((chat_id, message_id), None)
+        return None
+    return session.get("tracks")
+
+
+async def send_with_retry(send_coro_factory, retries: int = 3):
+    """Повторяет отправку при TelegramRetryAfter"""
+    for attempt in range(retries):
+        try:
+            return await send_coro_factory()
+        except TelegramRetryAfter as e:
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(e.retry_after + 0.5)
+    raise RuntimeError("Telegram не принял файл после повторов")
 
 
 def download_track_obj(track, path: str) -> dict:
@@ -100,32 +154,42 @@ def get_playlist_keyboard(tracks: list, page: int = 0) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-@dp.message(CommandStart())
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "👋 Привет! Я бот для скачивания музыки из Яндекс Музыки в высоком качестве (320 kbps).\n\n"
-        "🔗 Отправь мне ссылку на трек, альбом или плейлист (можно из мобильного приложения через кнопку «Поделиться»)."
-    )
+def resolve_playlist_by_uuid(playlist_uuid: str):
+    """Получает плейлист по UUID через API Яндекс Музыки"""
+    data = ym_client.request.get(f"https://api.music.yandex.net/playlist/{playlist_uuid}")
+    if not data:
+        return None
+    pl_data = data.get("result", data) if isinstance(data, dict) else data
+    return Playlist.de_json(pl_data, ym_client)
 
 
-@dp.message(F.text.contains("music.yandex"))
-async def handle_yandex_link(message: types.Message):
+async def process_yandex_link_message(message: types.Message):
+    """Общая логика обработки ссылок Яндекс Музыки для лички и каналов"""
+    if not message.text:
+        return
+
     url = message.text.strip()
-    status_msg = await message.answer("🔍 Распознаю ссылку...", parse_mode=None)
+    chat_id = message.chat.id
+    status_msg = await bot.send_message(chat_id=chat_id, text="🔍 Распознаю ссылку...", parse_mode=None)
 
     try:
         # 1. Проверка на отдельный трек
         track_match = TRACK_RE.search(url)
         if track_match:
             track_id = track_match.group(1)
+            cache_key = str(track_id)
             await status_msg.edit_text("🔍 Скачиваю трек в высоком качестве...")
 
-            if int(track_id) in track_file_cache:
+            if cache_key in track_file_cache:
                 t_cache_start = time.time()
-                await message.answer_audio(
-                    audio=track_file_cache[int(track_id)],
-                    title="Трек",
-                    performer="Яндекс Музыка"
+                cached_file_id = track_file_cache[cache_key]
+                await send_with_retry(
+                    lambda: bot.send_audio(
+                        chat_id=chat_id,
+                        audio=cached_file_id,
+                        title="Трек",
+                        performer="Яндекс Музыка",
+                    )
                 )
                 print(f"[Кэш] Отдельный трек отправлен за {time.time() - t_cache_start:.2f} сек", flush=True)
                 await status_msg.delete()
@@ -137,27 +201,33 @@ async def handle_yandex_link(message: types.Message):
                 return
 
             track_obj = tracks_list[0]
-            path = f"track_{track_id}.mp3"
+            path = f"track_{uuid.uuid4().hex}.mp3"
 
-            t_dl = time.time()
-            meta = await asyncio.to_thread(download_track_obj, track_obj, path)
-            print(f"[Загрузка с Яндекса] Трек скачан за {time.time() - t_dl:.2f} сек", flush=True)
+            try:
+                t_dl = time.time()
+                meta = await asyncio.to_thread(download_track_obj, track_obj, path)
+                print(f"[Загрузка с Яндекса] Трек скачан за {time.time() - t_dl:.2f} сек", flush=True)
 
-            await status_msg.edit_text("📤 Отправляю музыку...")
-            t_up = time.time()
-            msg = await message.answer_audio(
-                audio=FSInputFile(path),
-                title=meta["title"],
-                performer=meta["artist"],
-            )
-            print(f"[Загрузка в Telegram] Трек отправлен за {time.time() - t_up:.2f} сек\n---", flush=True)
+                await status_msg.edit_text("📤 Отправляю музыку...")
+                t_up = time.time()
+                msg = await send_with_retry(
+                    lambda: bot.send_audio(
+                        chat_id=chat_id,
+                        audio=FSInputFile(path),
+                        title=meta["title"],
+                        performer=meta["artist"],
+                    )
+                )
+                print(f"[Загрузка в Telegram] Трек отправлен за {time.time() - t_up:.2f} сек\n---", flush=True)
 
-            if msg.audio:
-                track_file_cache[track_obj.id] = msg.audio.file_id
+                if msg.audio:
+                    track_file_cache[str(track_obj.id)] = msg.audio.file_id
+                    cleanup_storage()
 
-            await status_msg.delete()
-            if os.path.exists(path):
-                os.remove(path)
+                await status_msg.delete()
+            finally:
+                if os.path.exists(path):
+                    os.remove(path)
             return
 
         # 2. Обработка сборников (плейлисты и альбомы)
@@ -171,36 +241,11 @@ async def handle_yandex_link(message: types.Message):
             playlist = await asyncio.to_thread(ym_client.users_playlists, kind, username)
 
         elif PUBLIC_PLAYLIST_UUID_RE.search(url):
-            uuid = PUBLIC_PLAYLIST_UUID_RE.search(url).group(1)
-
-            def resolve_mobile_playlist():
-                # Вариант 1: Прямой запрос к API по UUID
-                try:
-                    data = ym_client.request.get(f"https://api.music.yandex.net/playlist/{uuid}")
-                    print(f"[DEBUG] API по UUID ответил: {type(data).__name__}", flush=True)
-                    if data:
-                        pl_data = data.get("result", data) if isinstance(data, dict) else data
-                        pl = Playlist.de_json(pl_data, ym_client)
-                        if pl:
-                            return pl
-                except Exception as ex:
-                    print(f"[DEBUG] API по UUID ошибка: {ex!r}", flush=True)
-
-                # Вариант 2: Диагностика содержимого HTML-страницы
-                try:
-                    resp = requests.get(f"https://music.yandex.ru/playlists/{uuid}",
-                                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                                        timeout=10)
-                    for word in ("owner", "uid", "kind", "login"):
-                        pos = resp.text.find(word)
-                        snippet = resp.text[pos:pos + 120] if pos != -1 else "НЕТ"
-                        print(f"[DEBUG] '{word}': {snippet!r}", flush=True)
-                except Exception as ex:
-                    print(f"[DEBUG] HTML ошибка: {ex!r}", flush=True)
-
-                return None
-
-            playlist = await asyncio.to_thread(resolve_mobile_playlist)
+            playlist_uuid = PUBLIC_PLAYLIST_UUID_RE.search(url).group(1)
+            try:
+                playlist = await asyncio.to_thread(resolve_playlist_by_uuid, playlist_uuid)
+            except Exception as ex:
+                print(f"Ошибка получения плейлиста по UUID: {ex!r}", flush=True)
 
         elif ALBUM_RE.search(url):
             album_id = ALBUM_RE.search(url).group(1)
@@ -212,18 +257,14 @@ async def handle_yandex_link(message: types.Message):
                         tracks.extend(vol)
 
         if playlist:
-            print(f"[DEBUG] плейлист найден={playlist.title!r}, элементов до fetch={len(playlist.tracks or [])}", flush=True)
             playlist_title = playlist.title
-            
             if hasattr(playlist, "fetch_tracks") and (not playlist.tracks or len(playlist.tracks) == 0):
                 await asyncio.to_thread(playlist.fetch_tracks)
 
             if playlist.tracks:
                 tracks = [item.track for item in playlist.tracks if getattr(item, "track", None)]
-                print(f"[DEBUG] треков после распаковки items={len(tracks)}", flush=True)
 
         if not tracks:
-            print(f"[DEBUG] треков после фильтрации: 0, playlist={playlist is not None}", flush=True)
             await status_msg.edit_text(
                 "⚠️ Не удалось открыть плейлист по этой ссылке.\n"
                 "Откройте плейлист в браузере на компьютере и отправьте ссылку из адресной строки "
@@ -231,24 +272,43 @@ async def handle_yandex_link(message: types.Message):
             )
             return
 
-        user_playlists[message.from_user.id] = tracks
-        await status_msg.edit_text(
+        menu_msg = await status_msg.edit_text(
             f"🎵 Плейлист/Альбом: {playlist_title}\n"
             f"Всего треков: {len(tracks)}.\n"
             "Выбери нужный трек или скачай весь плейлист целиком кнопками ниже:",
             reply_markup=get_playlist_keyboard(tracks, page=0),
         )
+        save_playlist_session(chat_id, menu_msg.message_id, tracks)
 
     except Exception:
         traceback.print_exc()
         await status_msg.edit_text(
-            "⚠️ Произошла ошибка при обработке ссылки. Проверьте правильность и попробуйте еще раз.")
+            "⚠️ Произошла ошибка при обработке ссылки. Проверьте правильность и попробуйте еще раз."
+        )
+
+
+@dp.message(CommandStart())
+async def start_cmd(message: types.Message):
+    await message.answer(
+        "👋 Привет! Я бот для скачивания музыки из Яндекс Музыки в высоком качестве (320 kbps).\n\n"
+        "🔗 Отправь мне ссылку на трек, альбом или плейлист (можно из мобильного приложения через кнопку «Поделиться»)."
+    )
+
+
+@dp.message(F.text.contains("music.yandex"))
+async def handle_yandex_link_private(message: types.Message):
+    await process_yandex_link_message(message)
+
+
+@dp.channel_post(F.text.contains("music.yandex"))
+async def handle_yandex_link_channel(message: types.Message):
+    await process_yandex_link_message(message)
 
 
 @dp.callback_query(F.data.startswith("page:"))
 async def process_pagination(callback: types.CallbackQuery):
     page = int(callback.data.split(":")[1])
-    tracks = user_playlists.get(callback.from_user.id)
+    tracks = get_playlist_session(callback.message.chat.id, callback.message.message_id)
 
     if not tracks:
         await callback.answer("⚠️ Сессия устарела. Отправьте ссылку заново.", show_alert=True)
@@ -262,35 +322,51 @@ async def process_pagination(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "dl_all")
 async def process_download_all(callback: types.CallbackQuery):
-    tracks = user_playlists.get(callback.from_user.id)
+    tracks = get_playlist_session(callback.message.chat.id, callback.message.message_id)
     if not tracks:
         await callback.answer("⚠️ Сессия устарела. Отправьте ссылку заново.", show_alert=True)
         return
 
+    chat_id = callback.message.chat.id
+    total_tracks = len(tracks)
     await callback.answer("📥 Начинаю ускоренное скачивание плейлиста...")
-    status_msg = await callback.message.answer(f"⏳ Параллельная подготовка (0 / {len(tracks)})...")
+    status_msg = await bot.send_message(chat_id=chat_id, text=f"⏳ Параллельная подготовка (0 / {total_tracks})...")
 
     success_count = 0
     completed = 0
+    last_status_edit = time.monotonic()
     lock = asyncio.Lock()
+
+    async def maybe_update_progress(force: bool = False):
+        nonlocal last_status_edit
+        now = time.monotonic()
+        if force or completed == total_tracks or completed % 5 == 0 or (now - last_status_edit) >= 3.0:
+            last_status_edit = now
+            try:
+                await status_msg.edit_text(f"⏳ Скачивание плейлиста: выполнено {completed} из {total_tracks}")
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+            except Exception:
+                pass
 
     async def download_and_send_worker(track):
         nonlocal success_count, completed
         async with download_semaphore:
-            t_start = time.time()
-            track_id = track.id
-            path = f"track_{track_id}.mp3"
-            chat_id = callback.message.chat.id
+            cache_key = str(track.id)
+            path = f"track_{uuid.uuid4().hex}.mp3"
             artists = ", ".join(a.name for a in track.artists) if track.artists else "Яндекс Музыка"
 
             try:
-                if track_id in track_file_cache:
+                if cache_key in track_file_cache:
                     t_cache = time.time()
-                    msg = await bot.send_audio(
-                        chat_id=chat_id,
-                        audio=track_file_cache[track_id],
-                        title=track.title,
-                        performer=artists,
+                    cached_file_id = track_file_cache[cache_key]
+                    await send_with_retry(
+                        lambda: bot.send_audio(
+                            chat_id=chat_id,
+                            audio=cached_file_id,
+                            title=track.title,
+                            performer=artists,
+                        )
                     )
                     print(f"[Кэш] Трек '{track.title}' отправлен за {time.time() - t_cache:.2f} сек", flush=True)
                 else:
@@ -299,60 +375,72 @@ async def process_download_all(callback: types.CallbackQuery):
                     print(f"[Яндекс] '{track.title}' скачан за {time.time() - t_dl:.2f} сек", flush=True)
 
                     t_up = time.time()
-                    msg = await bot.send_audio(
-                        chat_id=chat_id,
-                        audio=FSInputFile(path),
-                        title=meta["title"],
-                        performer=meta["artist"],
+                    msg = await send_with_retry(
+                        lambda: bot.send_audio(
+                            chat_id=chat_id,
+                            audio=FSInputFile(path),
+                            title=meta["title"],
+                            performer=meta["artist"],
+                        )
                     )
                     print(f"[Telegram] '{track.title}' загружен за {time.time() - t_up:.2f} сек", flush=True)
 
                     if msg.audio:
-                        track_file_cache[track_id] = msg.audio.file_id
+                        track_file_cache[cache_key] = msg.audio.file_id
 
                 async with lock:
                     success_count += 1
                     completed += 1
-                    await status_msg.edit_text(f"⏳ Скачивание плейлиста: выполнено {completed} из {len(tracks)}")
+                    await maybe_update_progress()
 
             except Exception as e:
-                print(f"Ошибка при обработке трека {track.title}: {e}", flush=True)
+                print(f"Ошибка при обработке трека {track.title}: {e!r}", flush=True)
                 async with lock:
                     completed += 1
+                    await maybe_update_progress()
             finally:
                 if os.path.exists(path):
                     os.remove(path)
 
     tasks = [download_and_send_worker(track) for track in tracks]
     await asyncio.gather(*tasks)
+    cleanup_storage()
 
-    await status_msg.edit_text(f"✅ Готово! Успешно отправлено треков: {success_count} из {len(tracks)}.")
+    try:
+        await status_msg.edit_text(f"✅ Готово! Успешно отправлено треков: {success_count} из {total_tracks}.")
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=f"✅ Готово! Успешно отправлено треков: {success_count} из {total_tracks}.")
 
 
 @dp.callback_query(F.data.startswith("dl:"))
 async def process_download_track(callback: types.CallbackQuery):
     index = int(callback.data.split(":")[1])
-    tracks = user_playlists.get(callback.from_user.id)
+    tracks = get_playlist_session(callback.message.chat.id, callback.message.message_id)
 
     if not tracks or index >= len(tracks):
         await callback.answer("⚠️ Трек не найден в текущей сессии.", show_alert=True)
         return
 
+    chat_id = callback.message.chat.id
     track = tracks[index]
-    track_id = track.id
-    path = f"track_{track_id}.mp3"
+    cache_key = str(track.id)
+    path = f"track_{uuid.uuid4().hex}.mp3"
 
     await callback.answer(f"⬇️ Скачиваю: {track.title}")
-    status_msg = await callback.message.answer(f"🔍 Скачиваю трек №{index + 1}: {track.title}...")
+    status_msg = await bot.send_message(chat_id=chat_id, text=f"🔍 Скачиваю трек №{index + 1}: {track.title}...")
 
     try:
         t_start = time.time()
-        if track_id in track_file_cache:
+        if cache_key in track_file_cache:
             t_cache = time.time()
-            await callback.message.answer_audio(
-                audio=track_file_cache[track_id],
-                title=track.title,
-                performer=", ".join(a.name for a in track.artists) if track.artists else "Яндекс Музыка",
+            cached_file_id = track_file_cache[cache_key]
+            await send_with_retry(
+                lambda: bot.send_audio(
+                    chat_id=chat_id,
+                    audio=cached_file_id,
+                    title=track.title,
+                    performer=", ".join(a.name for a in track.artists) if track.artists else "Яндекс Музыка",
+                )
             )
             print(f"[Кэш] Трек по клику отправлен за {time.time() - t_cache:.2f} сек", flush=True)
             await status_msg.delete()
@@ -363,15 +451,19 @@ async def process_download_track(callback: types.CallbackQuery):
 
         await status_msg.edit_text("📤 Отправляю музыку...")
         t_up = time.time()
-        msg = await callback.message.answer_audio(
-            audio=FSInputFile(path),
-            title=meta["title"],
-            performer=meta["artist"],
+        msg = await send_with_retry(
+            lambda: bot.send_audio(
+                chat_id=chat_id,
+                audio=FSInputFile(path),
+                title=meta["title"],
+                performer=meta["artist"],
+            )
         )
         print(f"[Telegram] Трек по клику отправлен за {time.time() - t_up:.2f} сек", flush=True)
 
         if msg.audio:
-            track_file_cache[track_id] = msg.audio.file_id
+            track_file_cache[cache_key] = msg.audio.file_id
+            cleanup_storage()
 
         await status_msg.delete()
     except Exception:
@@ -391,6 +483,7 @@ async def process_noop(callback: types.CallbackQuery):
 async def handle_ping(request):
     return web.Response(text="Bot is alive")
 
+
 async def start_dummy_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
@@ -403,12 +496,8 @@ async def start_dummy_server():
 
 
 async def main():
-    # 1. Сначала запускаем веб-сервер, чтобы открыть порт для Render
     await start_dummy_server()
-    
     print("Бот успешно запущен и готов к работе со скоростным кэшем и параллельной загрузкой!", flush=True)
-    
-    # 2. Запуск поллинга бота
     await dp.start_polling(bot)
 
 
